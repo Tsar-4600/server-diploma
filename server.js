@@ -23,7 +23,7 @@ const connection = mysql.createConnection({
   host: '185.207.0.190',
   user: 'tsar',
   password: 'tsar12345',
-  database: 'test_DB',
+  database: 'test2_DB',
   charset: 'utf8mb4'
 });
 
@@ -82,8 +82,8 @@ function generateQuestionXML(data) {
   const root = create({ version: '1.0' }).ele('question', { type: data.questionType });
 
   // Общие поля
-  root.ele('name').ele('text').txt(escapeXml(data.name));
-  root.ele('questiontext', { format: 'html' }).ele('text').txt(escapeXml(data.questionText));
+  root.ele('name').ele('text').txt(escapeXml(data.name || ''));
+  root.ele('questiontext', { format: 'html' }).ele('text').txt(escapeXml(data.questionText || ''));
   root.ele('defaultgrade').txt(Number(data.defaultGrade || 1).toFixed(2));
   root.ele('penalty').txt(Number(data.penalty || 0).toFixed(2));
   root.ele('hidden').txt(data.hidden ? '1' : '0');
@@ -91,37 +91,49 @@ function generateQuestionXML(data) {
   // Обработка типов вопросов
   switch (data.questionType) {
     case 'multichoice':
-    case 'truefalse':
       root.ele('shuffleanswers').txt(data.shuffleAnswers ? '1' : '0');
       root.ele('single').txt(data.single ? 'true' : 'false');
 
-      data.answers.forEach((answer) => {
-        root.ele('answer', {
+      (data.answers || []).forEach((answer) => {
+        const answerNode = root.ele('answer', {
           fraction: answer.isCorrect ? '100' : '0',
-          format: 'html',
-        })
-          .ele('text').txt(escapeXml(answer.text)).up()
-          .ele('feedback').ele('text').txt('');
+          format: 'html'
+        });
+        answerNode.ele('text').txt(escapeXml(answer.text || ''));
+        answerNode.ele('feedback').ele('text').txt('');
       });
       break;
 
+    case 'truefalse':
+      root.ele('shuffleanswers').txt('0');
+      root.ele('single').txt('true');
+      
+      // Добавляем стандартные ответы для true/false
+      root.ele('answer', { fraction: '100', format: 'html' })
+        .ele('text').txt('true').up()
+        .ele('feedback').ele('text').txt('');
+      
+      root.ele('answer', { fraction: '0', format: 'html' })
+        .ele('text').txt('false').up()
+        .ele('feedback').ele('text').txt('');
+      break;
+
     case 'shortanswer':
-      if (data.correctAnswer) {
-        root.ele('answer').txt(escapeXml(data.correctAnswer));
-      }
+      root.ele('answer', { fraction: '100', format: 'plain_text' })
+        .ele('text').txt(escapeXml(data.shortAnswer || ''));
       break;
 
     case 'numerical':
       root.ele('answer', { fraction: '100' })
-        .ele('text').txt(Number(data.numericalAnswer).toFixed(2));
+        .ele('text').txt(Number(data.numericalAnswer || 0).toFixed(2));
       root.ele('tolerance').txt(Number(data.tolerance || 0).toFixed(2));
       break;
 
     case 'matching':
-      data.matchingPairs.forEach((pair) => {
-        root.ele('subquestion')
-          .ele('text').txt(escapeXml(pair.question)).up()
-          .ele('answer').txt(escapeXml(pair.answer));
+      (data.matchingPairs || []).forEach((pair) => {
+        root.ele('subquestion', { format: 'html' })
+          .ele('text').txt(escapeXml(pair.question || '')).up()
+          .ele('answer').ele('text').txt(escapeXml(pair.answer || ''));
       });
       break;
 
@@ -132,6 +144,8 @@ function generateQuestionXML(data) {
       essayNode.ele('responserequired').txt(settings.responseRequired ? '1' : '0');
       essayNode.ele('responsefieldlines')
         .txt(String(Math.min(Math.max(settings.responseFieldLines || 15, 5), 50)));
+      essayNode.ele('attachments').txt(settings.attachments || '0');
+      essayNode.ele('attachmentsrequired').txt(settings.attachmentsRequired || '0');
       break;
 
     default:
@@ -202,17 +216,55 @@ app.get('/api/validate-token', authenticateJWT, (req, res) => {
   });
 });
 
-// Получение списка вопросов
+// Получение списка категорий
+app.get('/api/categories', (req, res) => {
+  const query = 'SELECT name FROM Category ORDER BY name';
+  connection.execute(query, (err, results) => {
+    if (err) {
+      console.error('Ошибка при загрузке категорий:', err.stack);
+      return res.status(500).json({ message: 'Ошибка при загрузке категорий' });
+    }
+    res.json(results.map(row => row.name));
+  });
+});
+
+// Получение тем по категории
+app.get('/api/themes', (req, res) => {
+  const { category } = req.query;
+  if (!category) return res.status(400).json({ message: 'Укажите категорию' });
+
+  const query = `
+    SELECT t.name 
+    FROM Theme t
+    JOIN Category c ON t.id_category = c.id_category
+    WHERE c.name = ?
+    ORDER BY t.name
+  `;
+  
+  connection.execute(query, [category], (err, results) => {
+    if (err) {
+      console.error('Ошибка при загрузке тем:', err.stack);
+      return res.status(500).json({ message: 'Ошибка при загрузке тем' });
+    }
+    res.json(results.map(row => row.name));
+  });
+});
+
+// Обновите запрос для получения вопросов, чтобы включать тему
 app.get('/api/questions', (req, res) => {
-  const query = `SELECT 
-                  moodle_questions.id_question as id,
-                  moodle_questions.title as name,
-                  question_types.name AS type,
-                  Category.name as category,
-                  moodle_questions.xml
-                FROM moodle_questions
-                JOIN question_types ON moodle_questions.id_question_type = question_types.id_question_type
-                JOIN Category ON moodle_questions.id_category = Category.id_category`;
+  const query = `
+    SELECT 
+      mq.id_question as id,
+      mq.title as name,
+      qt.name AS type,
+      c.name as category,
+      t.name as theme,
+      mq.xml
+    FROM moodle_questions mq
+    JOIN question_types qt ON mq.id_question_type = qt.id_question_type
+    JOIN Theme t ON mq.id_theme = t.id_theme
+    JOIN Category c ON t.id_category = c.id_category
+  `;
 
   connection.execute(query, (err, results) => {
     if (err) {
@@ -223,36 +275,40 @@ app.get('/api/questions', (req, res) => {
   });
 });
 
-//Вывод моих тестов и банка с тестами
+//Вывод банка с тестами
 app.get('/api/test-bank', authenticateJWT, (req, res) => {
   const sql = `
-    SELECT 
-      Test.id_test,
-      Test.name AS test_name,
-      User.username AS username,
-      Category.name AS category_name,
-      COALESCE(AVG(TestRating.rating), 0) AS avg_rating
-    FROM 
-      Test
-    LEFT JOIN 
-      TestRating ON Test.id_test = TestRating.id_test
-    LEFT JOIN
-      Category ON Test.id_category = Category.id_category
-    JOIN 
-      User ON Test.id_user = User.id_user
-    WHERE
-      Test.public = 1
-    GROUP BY 
-      Test.id_test,
-      Test.name,
-      Category.name;
+        SELECT 
+            Test.id_test,
+            Test.name AS test_name,
+            User.username,
+            Theme.name AS theme_name,
+            Category.name AS category_name,
+            COALESCE(AVG(TestRating.rating), 0) AS avg_rating,
+            COUNT(TestRating.id_rating) AS rating_count,
+            Test.xml
+        FROM 
+            Test
+        LEFT JOIN 
+            TestRating ON Test.id_test = TestRating.id_test
+        LEFT JOIN
+            Theme ON Test.id_theme = Theme.id_theme
+        LEFT JOIN
+            Category ON Theme.id_category = Category.id_category
+        JOIN 
+            User ON Test.id_user = User.id_user
+        WHERE
+            Test.public = 1
+        GROUP BY 
+            Test.id_test
+        ORDER BY
+            avg_rating DESC, rating_count DESC
   `;
   connection.query(sql, (err, results) => {
     if (err) {
       console.error(err);
       return res.status(500).json({ error: 'Ошибка базы данных' });
     }
-    // results — массив объектов вида { id, id_user, xml }
    
     res.json(results);
    
@@ -261,22 +317,26 @@ app.get('/api/test-bank', authenticateJWT, (req, res) => {
 });
 
 
+// Обновленный маршрут для получения вопросов
 app.get('/api/my-questions', authenticateJWT, (req, res) => {
   const userId = req.user.userId;
 
   const query = `
-                SELECT 
-                  moodle_questions.id_question as id,
-                  moodle_questions.title as name,
-                  question_types.name AS type,
-                  Category.name as category,
-                  moodle_questions.xml
-                FROM moodle_questions
-                JOIN question_types ON moodle_questions.id_question_type = question_types.id_question_type
-                JOIN Category ON moodle_questions.id_category = Category.id_category
-                WHERE moodle_questions.id_user = ?`; // Добавляем условие WHERE
+    SELECT 
+      mq.id_question as id,
+      mq.title as name,
+      qt.name AS type,
+      c.name as category,
+      t.name as theme,
+      mq.xml
+    FROM moodle_questions mq
+    JOIN question_types qt ON mq.id_question_type = qt.id_question_type
+    JOIN Theme t ON mq.id_theme = t.id_theme
+    JOIN Category c ON t.id_category = c.id_category
+    WHERE mq.id_user = ?
+  `;
 
-  connection.execute(query, [userId], (err, results) => { // Передаем userId как параметр
+  connection.execute(query, [userId], (err, results) => {
     if (err) {
       console.error('Ошибка при выполнении запроса:', err.stack);
       return res.status(500).json({ message: 'Ошибка при загрузке вопросов' });
@@ -285,28 +345,43 @@ app.get('/api/my-questions', authenticateJWT, (req, res) => {
   });
 });
 
+
+
+
+
 //Тесты пользователя
 
 app.get('/api/my-tests', authenticateJWT, (req, res) => {
   const userId = req.user.userId;
 
   const query = `
-                SELECT 
-                  Test.id_test as id,
-                  Test.name as name,
-                  Category.name as category,
-                  Test.public,
-                  Test.xml
-                FROM Test
-                JOIN Category ON Test.id_category = Category.id_category
-                WHERE Test.id_user = ?`;
+    SELECT 
+      t.id_test as id,
+      t.name as name,
+      t.public,
+      t.xml,
+      th.name as theme,
+      c.name as category
+    FROM Test t
+    JOIN Theme th ON t.id_theme = th.id_theme
+    JOIN Category c ON th.id_category = c.id_category
+    WHERE t.id_user = ?
+    ORDER BY t.id_test DESC`;
 
   connection.execute(query, [userId], (err, results) => {
     if (err) {
       console.error('Ошибка при выполнении запроса:', err.stack);
-      return res.status(500).json({ message: 'Ошибка при загрузке тестов' });
+      return res.status(500).json({ 
+        success: false,
+        message: 'Ошибка при загрузке тестов',
+        error: err.message
+      });
     }
-    res.json(results);
+    
+    res.json({
+      success: true,
+      data: results
+    });
   });
 });
 
@@ -391,50 +466,103 @@ app.post('/api/register', async (req, res) => {
 });
 
 // Создание вопроса
-app.post('/api/my-questions/create', authenticateJWT, (req, res) => {
+// Обновленный маршрут для создания вопроса
+app.post('/api/my-questions/create', authenticateJWT, async (req, res) => {
   try {
+    const { name, theme, questionText, questionType, ...questionData } = req.body;
+    
+    // Генерация XML
     const xml = generateQuestionXML(req.body);
-    console.log(xml);
-    getOrCreateQuestionType(connection, req.body.questionType, (err, questionTypeId) => {
-      if (err) {
-        console.error('Ошибка типа вопроса:', err);
-        return res.status(500).json({ status: 'error', message: 'Ошибка типа вопроса' });
+    
+    // Начинаем транзакцию
+    connection.beginTransaction(async (beginErr) => {
+      if (beginErr) {
+        console.error('Ошибка начала транзакции:', beginErr);
+        return res.status(500).json({ status: 'error', message: 'Ошибка сервера' });
       }
 
-      getOrCreateCategory(connection, req.body.name, (err, categoryId) => {
-        if (err) {
-          console.error('Ошибка категории:', err);
-          return res.status(500).json({ status: 'error', message: 'Ошибка категории' });
+      try {
+        // 1. Получаем или создаем категорию
+        const [categoryResult] = await connection.promise().execute(
+          'SELECT id_category FROM Category WHERE name = ?',
+          [name]
+        );
+        
+        let categoryId;
+        if (categoryResult.length > 0) {
+          categoryId = categoryResult[0].id_category;
+        } else {
+          const [insertResult] = await connection.promise().execute(
+            'INSERT INTO Category (name) VALUES (?)',
+            [name]
+          );
+          categoryId = insertResult.insertId;
         }
 
-        connection.query(
-          `INSERT INTO moodle_questions 
-           (id_category, id_question_type, id_user, title, xml) 
-           VALUES (?, ?, ?, ?, ?)`,
-          [categoryId, questionTypeId, req.user.userId, req.body.questionText, xml],
-          (err) => {
-            if (err) {
-              console.error('Ошибка сохранения:', err);
-              return res.status(500).json({ status: 'error', message: 'Ошибка сохранения' });
-            }
+        // 2. Получаем или создаем тему
+        const [themeResult] = await connection.promise().execute(
+          'SELECT id_theme FROM Theme WHERE name = ? AND id_category = ?',
+          [theme, categoryId]
+        );
+        
+        let themeId;
+        if (themeResult.length > 0) {
+          themeId = themeResult[0].id_theme;
+        } else {
+          const [insertResult] = await connection.promise().execute(
+            'INSERT INTO Theme (id_category, name) VALUES (?, ?)',
+            [categoryId, theme]
+          );
+          themeId = insertResult.insertId;
+        }
 
-            res.json({
-              status: 'success',
-              message: 'Вопрос сохранен',
-              data: { xml }
+        // 3. Получаем ID типа вопроса
+        const [typeResult] = await connection.promise().execute(
+          'SELECT id_question_type FROM question_types WHERE name = ?',
+          [questionType]
+        );
+        
+        if (typeResult.length === 0) {
+          throw new Error('Тип вопроса не найден');
+        }
+        const questionTypeId = typeResult[0].id_question_type;
+
+        // 4. Сохраняем вопрос
+        await connection.promise().execute(
+          `INSERT INTO moodle_questions 
+           (id_theme, id_question_type, id_user, title, xml) 
+           VALUES (?, ?, ?, ?, ?)`,
+          [themeId, questionTypeId, req.user.userId, questionText, xml]
+        );
+
+        // Подтверждаем транзакцию
+        connection.commit((commitErr) => {
+          if (commitErr) {
+            console.error('Ошибка подтверждения транзакции:', commitErr);
+            return connection.rollback(() => {
+              res.status(500).json({ status: 'error', message: 'Ошибка сохранения' });
             });
           }
-        );
-      });
+
+          res.json({
+            status: 'success',
+            message: 'Вопрос сохранен',
+            data: { xml }
+          });
+        });
+      } catch (error) {
+        // Откатываем транзакцию при ошибке
+        connection.rollback(() => {
+          console.error('Ошибка в транзакции:', error);
+          res.status(500).json({ status: 'error', message: error.message });
+        });
+      }
     });
   } catch (error) {
     console.error('Ошибка генерации XML:', error);
     res.status(400).json({ status: 'error', message: error.message });
   }
 });
-
-
-
 /* функция для для добавления отзыва */
 
 
@@ -469,59 +597,247 @@ app.post('/api/rate-test', authenticateJWT, (req, res) => {
 *
 */
 app.post('/api/save-test', authenticateJWT, async (req, res) => {
-    const { name, category, questions, xml } = req.body;
-  const userId = req.user.userId;
+    const { name, theme, xml } = req.body;
+    const userId = req.user.userId;
 
-  if (!name || !category || !questions || !xml) {
-    return res.status(400).json({ 
-      success: false,
-      message: 'Необходимо указать название теста, категорию, вопросы и XML' 
-    });
-  }
-
-  try {
-    // 1. Находим или создаем категорию
-    const [categoryResult] = await connection.promise().execute(
-      `SELECT id_category FROM Category WHERE name = ?`,
-      [category]
-    );
-    
-    let categoryId;
-    if (categoryResult.length > 0) {
-      categoryId = categoryResult[0].id_category;
-    } else {
-      const [insertResult] = await connection.promise().execute(
-        `INSERT INTO Category (name) VALUES (?)`,
-        [category]
-      );
-      categoryId = insertResult.insertId;
+    if (!name || !theme || !xml) {
+        return res.status(400).json({ 
+            success: false,
+            message: 'Необходимо указать название теста, тему и XML-контент' 
+        });
     }
 
-    // 2. Сохраняем тест
-    const [testResult] = await connection.promise().execute(
-      `INSERT INTO Test (id_user, id_category, name, xml, public) 
-       VALUES (?, ?, ?, ?, 1)`,
-      [userId, categoryId, name, xml]
-    );
+    try {
+        // 1. Находим или создаем тему
+        const [themeResult] = await connection.promise().execute(
+            `SELECT id_theme FROM Theme WHERE name = ?`,
+            [theme]
+        );
+        
+        let themeId;
+        if (themeResult.length > 0) {
+            themeId = themeResult[0].id_theme;
+        } else {
+            const [insertResult] = await connection.promise().execute(
+                `INSERT INTO Theme (name) VALUES (?)`,
+                [theme]
+            );
+            themeId = insertResult.insertId;
+        }
 
-    const testId = testResult.insertId;
+        // 2. Сохраняем тест (без привязки к вопросам)
+        const [testResult] = await connection.promise().execute(
+            `INSERT INTO Test (id_user, id_theme, name, xml, public) 
+             VALUES (?, ?, ?, ?, 1)`,
+            [userId, themeId, name, xml]
+        );
 
-    res.status(200).json({
-      success: true,
-      message: 'Тест успешно сохранен',
-      testId
-    });
+        res.status(200).json({
+            success: true,
+            message: 'Тест успешно сохранен',
+            testId: testResult.insertId
+        });
 
-  } catch (error) {
-    console.error('Ошибка сохранения теста:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Ошибка сервера при сохранении теста'
-    });
-  }
+    } catch (error) {
+        console.error('Ошибка сохранения теста:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Ошибка сервера при сохранении теста'
+        });
+    }
 });
 
+// Получение списка категорий (остается без изменений)
+app.get('/api/categories', (req, res) => {
+  const query = 'SELECT name FROM Category ORDER BY name';
+  connection.execute(query, (err, results) => {
+    if (err) {
+      console.error('Ошибка при загрузке категорий:', err.stack);
+      return res.status(500).json({ message: 'Ошибка при загрузке категорий' });
+    }
+    res.json(results.map(row => row.name));
+  });
+});
 
+// Создание новой категории
+app.post('/api/categories/create', authenticateJWT, (req, res) => {
+  const { name } = req.body;
+  
+  if (!name || typeof name !== 'string' || name.trim().length === 0) {
+    return res.status(400).json({ 
+      success: false,
+      message: 'Укажите корректное название категории' 
+    });
+  }
+
+  const trimmedName = name.trim();
+
+  connection.beginTransaction(err => {
+    if (err) {
+      console.error('Ошибка начала транзакции:', err);
+      return res.status(500).json({ message: 'Ошибка сервера' });
+    }
+
+    // 1. Проверка существования категории
+    connection.execute(
+      'SELECT id_category FROM Category WHERE name = ? FOR UPDATE',
+      [trimmedName],
+      (err, results) => {
+        if (err) {
+          return connection.rollback(() => {
+            console.error('Ошибка проверки категории:', err);
+            res.status(500).json({ message: 'Ошибка сервера' });
+          });
+        }
+
+        if (results.length > 0) {
+          return connection.rollback(() => {
+            res.status(409).json({ 
+              success: false,
+              message: 'Категория с таким названием уже существует' 
+            });
+          });
+        }
+
+        // 2. Создание категории
+        connection.execute(
+          'INSERT INTO Category (name) VALUES (?)',
+          [trimmedName],
+          (err, result) => {
+            if (err) {
+              return connection.rollback(() => {
+                console.error('Ошибка создания категории:', err);
+                res.status(500).json({ message: 'Ошибка создания категории' });
+              });
+            }
+
+            connection.commit(err => {
+              if (err) {
+                return connection.rollback(() => {
+                  console.error('Ошибка коммита:', err);
+                  res.status(500).json({ message: 'Ошибка сервера' });
+                });
+              }
+
+              res.status(201).json({ 
+                success: true,
+                id: result.insertId,
+                name: trimmedName
+              });
+            });
+          }
+        );
+      }
+    );
+  });
+});
+
+// Создание новой темы
+app.post('/api/themes/create', authenticateJWT, (req, res) => {
+  const { category, theme } = req.body;
+  
+  if (!category || typeof category !== 'string' || category.trim().length === 0) {
+    return res.status(400).json({ 
+      success: false,
+      message: 'Укажите корректное название категории' 
+    });
+  }
+
+  if (!theme || typeof theme !== 'string' || theme.trim().length === 0) {
+    return res.status(400).json({ 
+      success: false,
+      message: 'Укажите корректное название темы' 
+    });
+  }
+
+  const trimmedCategory = category.trim();
+  const trimmedTheme = theme.trim();
+
+  connection.beginTransaction(err => {
+    if (err) {
+      console.error('Ошибка начала транзакции:', err);
+      return res.status(500).json({ message: 'Ошибка сервера' });
+    }
+
+    // 1. Находим ID категории с блокировкой
+    connection.execute(
+      'SELECT id_category FROM Category WHERE name = ? FOR UPDATE',
+      [trimmedCategory],
+      (err, categoryResults) => {
+        if (err) {
+          return connection.rollback(() => {
+            console.error('Ошибка поиска категории:', err);
+            res.status(500).json({ message: 'Ошибка сервера' });
+          });
+        }
+
+        if (categoryResults.length === 0) {
+          return connection.rollback(() => {
+            res.status(404).json({ 
+              success: false,
+              message: 'Категория не найдена' 
+            });
+          });
+        }
+
+        const categoryId = categoryResults[0].id_category;
+
+        // 2. Проверяем существование темы в категории
+        connection.execute(
+          'SELECT id_theme FROM Theme WHERE name = ? AND id_category = ? FOR UPDATE',
+          [trimmedTheme, categoryId],
+          (err, themeResults) => {
+            if (err) {
+              return connection.rollback(() => {
+                console.error('Ошибка проверки темы:', err);
+                res.status(500).json({ message: 'Ошибка сервера' });
+              });
+            }
+
+            if (themeResults.length > 0) {
+              return connection.rollback(() => {
+                res.status(409).json({ 
+                  success: false,
+                  message: 'Тема с таким названием уже существует в этой категории' 
+                });
+              });
+            }
+
+            // 3. Создаем тему
+            connection.execute(
+              'INSERT INTO Theme (id_category, name) VALUES (?, ?)',
+              [categoryId, trimmedTheme],
+              (err, result) => {
+                if (err) {
+                  return connection.rollback(() => {
+                    console.error('Ошибка создания темы:', err);
+                    res.status(500).json({ message: 'Ошибка создания темы' });
+                  });
+                }
+
+                connection.commit(err => {
+                  if (err) {
+                    return connection.rollback(() => {
+                      console.error('Ошибка коммита:', err);
+                      res.status(500).json({ message: 'Ошибка сервера' });
+                    });
+                  }
+
+                  res.status(201).json({ 
+                    success: true,
+                    id: result.insertId,
+                    category: trimmedCategory,
+                    theme: trimmedTheme
+                  });
+                });
+              }
+            );
+          }
+        );
+      }
+    );
+  });
+});
 
 /*
 * @route DELETE /api/my-questions/:id
